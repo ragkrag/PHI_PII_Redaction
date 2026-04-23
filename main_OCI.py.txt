@@ -1,0 +1,234 @@
+"""
+PII Redaction Demo for OCI (Oracle Cloud Infrastructure)
+
+Same defense-in-depth model:
+  1. Disable sensitive span data
+  2. Redact PII before logging
+  3. Global logging filter (catch-all)
+
+Works with:
+  - OCI Logging (stdout ingestion)
+  - OCI APM via OpenTelemetry (OTLP)
+"""
+
+import asyncio
+import logging
+import os
+import threading
+from typing import Annotated
+
+from agent_framework import Agent, tool
+from agent_framework.observability import enable_instrumentation
+from agent_framework.openai import OpenAIChatClient
+
+from dotenv import load_dotenv
+from pydantic import Field
+
+# OpenTelemetry (OCI-compatible)
+from opentelemetry import trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+# ---------------------------------------------------------------------------
+# Logging (OCI Logging compatible)
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# PII Redaction (Presidio default)
+# ---------------------------------------------------------------------------
+
+_presidio_analyzer = None
+_presidio_anonymizer = None
+
+
+def _init_presidio():
+    from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
+    from presidio_anonymizer import AnonymizerEngine
+
+    registry = RecognizerRegistry()
+    registry.load_predefined_recognizers(languages=["en"])
+    registry.remove_recognizer("SpacyRecognizer")
+
+    analyzer = AnalyzerEngine(registry=registry, supported_languages=["en"], nlp_engine=None)
+    anonymizer = AnonymizerEngine()
+    return analyzer, anonymizer
+
+
+def redact_pii_presidio(text: str) -> str:
+    global _presidio_analyzer, _presidio_anonymizer
+
+    if _presidio_analyzer is None:
+        _presidio_analyzer, _presidio_anonymizer = _init_presidio()
+
+    results = _presidio_analyzer.analyze(text=text, language="en")
+
+    if results:
+        anonymized = _presidio_anonymizer.anonymize(text=text, analyzer_results=results)
+        return anonymized.text
+
+    return text
+
+
+# Optional placeholder for OCI AI (if you integrate later)
+def redact_pii_oci_ai(text: str) -> str:
+    """
+    Placeholder for OCI AI Language / Data Labeling / custom model.
+    OCI doesn't yet have a direct drop-in PII API like Azure Language.
+    """
+    return text  # fallback
+
+
+PII_REDACTION_METHOD = os.getenv("PII_REDACTION_METHOD", "presidio")
+
+_redact_guard = threading.local()
+
+
+def redact_pii(text: str) -> str:
+    if not text or not text.strip():
+        return text
+
+    if getattr(_redact_guard, "active", False):
+        return text
+
+    _redact_guard.active = True
+    try:
+        if PII_REDACTION_METHOD == "oci_ai":
+            return redact_pii_oci_ai(text)
+        return redact_pii_presidio(text)
+    finally:
+        _redact_guard.active = False
+
+
+# ---------------------------------------------------------------------------
+# Global Logging Filter (CRITICAL)
+# ---------------------------------------------------------------------------
+
+class PIILoggingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = redact_pii(record.msg)
+
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {
+                    k: redact_pii(str(v)) if isinstance(v, str) else v
+                    for k, v in record.args.items()
+                }
+            elif isinstance(record.args, tuple):
+                record.args = tuple(
+                    redact_pii(str(a)) if isinstance(a, str) else a
+                    for a in record.args
+                )
+        return True
+
+
+_pii_filter = PIILoggingFilter()
+root_logger = logging.getLogger()
+root_logger.addFilter(_pii_filter)
+
+for handler in root_logger.handlers:
+    handler.addFilter(_pii_filter)
+
+# ---------------------------------------------------------------------------
+# OpenTelemetry → OCI APM
+# ---------------------------------------------------------------------------
+
+def setup_tracing():
+    resource = Resource(attributes={
+        "service.name": "pii-demo-agent-oci"
+    })
+
+    provider = TracerProvider(resource=resource)
+
+    otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if otlp_endpoint:
+        exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
+        processor = BatchSpanProcessor(exporter)
+        provider.add_span_processor(processor)
+
+    trace.set_tracer_provider(provider)
+
+
+setup_tracing()
+
+# ---------------------------------------------------------------------------
+# Disable sensitive span data (Layer 1)
+# ---------------------------------------------------------------------------
+
+enable_instrumentation(enable_sensitive_data=False)
+
+# ---------------------------------------------------------------------------
+# LLM Client (OCI / OpenAI compatible)
+# ---------------------------------------------------------------------------
+
+client = OpenAIChatClient(
+    api_key=os.environ["OPENAI_API_KEY"],
+    model_id=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+)
+
+# ---------------------------------------------------------------------------
+# Tool
+# ---------------------------------------------------------------------------
+
+@tool
+def lookup_customer(
+    name: Annotated[str, Field(description="Customer full name")],
+    email: Annotated[str, Field(description="Customer email address")],
+) -> dict:
+    logger.info(f"Looking up customer record for {name} ({email})")
+
+    return {
+        "name": name,
+        "email": email,
+        "phone": "+1-555-867-5309",
+        "ssn_last4": "6789",
+        "address": "742 Evergreen Terrace, Springfield, IL",
+        "account_number": "ACCT-00042",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+
+agent = Agent(
+    name="oci-pii-agent",
+    client=client,
+    instructions=(
+        "You are a helpful assistant. You can look up customer records."
+    ),
+    tools=[lookup_customer],
+)
+
+# ---------------------------------------------------------------------------
+# Test
+# ---------------------------------------------------------------------------
+
+async def main():
+    print("\n--- Query 1 ---")
+    response = await agent.run(
+        "My name is John Smith, email john@example.com, SSN 123-45-6789. "
+        "Can you look me up?"
+    )
+    print(response.text)
+
+    print("\n--- Query 2 ---")
+    response = await agent.run(
+        "Look up Jane Doe with email jane@contoso.com"
+    )
+    print(response.text)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
