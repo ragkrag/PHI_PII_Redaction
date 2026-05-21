@@ -56,9 +56,6 @@ OpenAI
 Azure OpenAI
 GitHub Models
 Quickstart
-# Clone repo
-git clone https://github.com/gameri87/PII-Redaction-Demo.git
-cd PII-Redaction
 
 # Configure environment
 cp .env.sample .env
